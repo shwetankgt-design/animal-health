@@ -1,0 +1,249 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============== AUTH / USERS ==============
+
+enum RoleName {
+  FIELD_VET
+  SDRNO
+  LAB_USER
+  DAHD_ADMIN
+  DAHD_ANALYST
+}
+
+model User {
+  id           String   @id @default(cuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         RoleName
+  stateId      String?
+  state        StateUT? @relation(fields: [stateId], references: [id])
+  districtId   String?
+  district     District? @relation(fields: [districtId], references: [id])
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now())
+
+  submissions       Submission[]      @relation("SubmittedBy")
+  auditEntries      AuditLog[]        @relation("ActorUser")
+  nodalOfficerLinks NodalOfficer[]
+  correctionRequestsMade CorrectionRequest[] @relation("CorrectionRequestedBy")
+}
+
+// ============== MASTER DATA ==============
+
+model StateUT {
+  id         String   @id @default(cuid())
+  code       String   @unique
+  name       String   @unique
+  type       String // "State" | "UT"
+  effectiveFrom DateTime @default(now())
+  active     Boolean  @default(true)
+
+  districts     District[]
+  users         User[]
+  nodalOfficer  NodalOfficer?
+  submissions   Submission[]
+  zeroReports   ZeroReport[]
+}
+
+model District {
+  id        String   @id @default(cuid())
+  name      String
+  stateId   String
+  state     StateUT  @relation(fields: [stateId], references: [id])
+  active    Boolean  @default(true)
+
+  users        User[]
+  reportLines  SubmissionLine[]
+
+  @@unique([stateId, name])
+}
+
+model Disease {
+  id           String   @id @default(cuid())
+  code         String   @unique
+  name         String   @unique
+  isCatchAll   Boolean  @default(false)
+  approved     Boolean  @default(true)
+  effectiveFrom DateTime @default(now())
+  active       Boolean  @default(true)
+
+  lines        SubmissionLine[]
+}
+
+model Species {
+  id       String @id @default(cuid())
+  code     String @unique
+  name     String @unique
+  active   Boolean @default(true)
+
+  lines    SubmissionLineSpecies[]
+}
+
+model NodalOfficer {
+  id           String   @id @default(cuid())
+  name         String
+  designation  String
+  mobile       String
+  email        String
+  stateId      String   @unique
+  state        StateUT  @relation(fields: [stateId], references: [id])
+  userId       String?  @unique
+  user         User?    @relation(fields: [userId], references: [id])
+  active       Boolean  @default(true)
+}
+
+// ============== FACT DATA ==============
+
+enum SubmissionStatus {
+  DRAFT
+  SUBMITTED
+  CORRECTION_REQUESTED
+}
+
+// One Submission = one State + one Date (the "day's report")
+model Submission {
+  id           String   @id @default(cuid())
+  stateId      String
+  state        StateUT  @relation(fields: [stateId], references: [id])
+  reportDate   DateTime // date-only, normalized to midnight UTC
+  status       SubmissionStatus @default(DRAFT)
+  submittedById String?
+  submittedBy   User?   @relation("SubmittedBy", fields: [submittedById], references: [id])
+  submittedAt  DateTime?
+  source       String   @default("MANUAL") // MANUAL | BULK_UPLOAD
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  lines        SubmissionLine[]
+  auditLogs    AuditLog[]
+  correctionRequests CorrectionRequest[]
+
+  @@unique([stateId, reportDate])
+}
+
+// DAHD Admin cannot edit a State's submitted figures directly — only request a
+// correction, preserving accountability. The State's SDRNO then edits with a
+// reason, which resolves the request.
+model CorrectionRequest {
+  id            String   @id @default(cuid())
+  submissionId  String
+  submission    Submission @relation(fields: [submissionId], references: [id])
+  reason        String
+  requestedById String
+  requestedBy   User     @relation("CorrectionRequestedBy", fields: [requestedById], references: [id])
+  status        String   @default("OPEN") // OPEN | RESOLVED
+  createdAt     DateTime @default(now())
+  resolvedAt    DateTime?
+}
+
+// One line = one Disease within a Submission (grain: Date, State, Disease; species is multi-select attached)
+model SubmissionLine {
+  id                String   @id @default(cuid())
+  submissionId      String
+  submission        Submission @relation(fields: [submissionId], references: [id])
+  diseaseId         String
+  disease           Disease  @relation(fields: [diseaseId], references: [id])
+  districtId        String?
+  district          District? @relation(fields: [districtId], references: [id])
+  village           String?
+  block             String?
+
+  isNil             Boolean  @default(false)
+
+  probableCases     Int      @default(0) // Probable/Clinically Infected
+  labConfirmed      Int      @default(0)
+  // totalCasesToday computed = probableCases + labConfirmed (not stored as user input, but persisted for query speed)
+  totalCasesToday   Int      @default(0)
+  deathsToday       Int      @default(0)
+  cumulativeCases   Int      @default(0) // since 1 Jan
+  activeCases       Int      @default(0)
+  cumulativeDeaths  Int      @default(0)
+  recoveredCumulative Int    @default(0)
+  vaccinationCumulative Int? // optional
+  culledCount       Int?     // optional
+  controlMeasures   String?  // tags/text
+  remarks           String?
+
+  decreaseReason    String? // required if cumulative cases/deaths < yesterday
+
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  speciesLinks      SubmissionLineSpecies[]
+
+  @@unique([submissionId, diseaseId])
+}
+
+model SubmissionLineSpecies {
+  id                String @id @default(cuid())
+  lineId            String
+  line              SubmissionLine @relation(fields: [lineId], references: [id])
+  speciesId         String
+  species           Species @relation(fields: [speciesId], references: [id])
+
+  @@unique([lineId, speciesId])
+}
+
+// Distinguishes "submitted, nothing to report" vs "not yet submitted" at State-day grain
+model ZeroReport {
+  id          String   @id @default(cuid())
+  stateId     String
+  state       StateUT  @relation(fields: [stateId], references: [id])
+  reportDate  DateTime
+  declaredAt  DateTime @default(now())
+  declaredById String?
+
+  @@unique([stateId, reportDate])
+}
+
+// ============== AUDIT ==============
+
+model AuditLog {
+  id            String   @id @default(cuid())
+  submissionId  String?
+  submission    Submission? @relation(fields: [submissionId], references: [id])
+  entityType    String   // "SubmissionLine" | "Submission" | "MasterData:Disease" ...
+  entityId      String
+  action        String   // "CREATE" | "UPDATE" | "SUBMIT" | "CORRECTION"
+  fieldChanges  String   // JSON string of {field: {old,new}}
+  reason        String?
+  actorUserId   String
+  actorUser     User     @relation("ActorUser", fields: [actorUserId], references: [id])
+  createdAt     DateTime @default(now())
+}
+
+// ============== BULK UPLOAD STAGING ==============
+
+model UploadBatch {
+  id           String   @id @default(cuid())
+  stateId      String?
+  fileName     String
+  uploadedById String
+  status       String   @default("STAGED") // STAGED | COMMITTED | DISCARDED
+  createdAt    DateTime @default(now())
+  committedAt  DateTime?
+
+  rows         UploadRow[]
+}
+
+model UploadRow {
+  id           String   @id @default(cuid())
+  batchId      String
+  batch        UploadBatch @relation(fields: [batchId], references: [id])
+  rowIndex     Int
+  cellRef      String?
+  rawData      String   // JSON of parsed raw row
+  mappedData   String?  // JSON of mapped field -> value
+  result       String   // ACCEPTED | ACCEPTED_WARNING | REJECTED
+  violations   String?  // JSON array of {field, rule, valueReceived, expected}
+  uploadNotes  String?  // stray free text that doesn't resolve to master data
+  acknowledged Boolean  @default(false)
+}
